@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { TorrentStatus } from '../../preload/index.d'
+import type { TorrentStatus, TorrentFile } from '../../preload/index.d'
 
 // Test magnet - Big Buck Bunny
 const TEST_MAGNET = 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.btorrent.xyz&tr=wss%3A%2F%2Ftracker.fastcast.nz&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fbig-buck-bunny.torrent'
@@ -25,6 +25,11 @@ function App(): React.JSX.Element {
   const [canPlayVideo, setCanPlayVideo] = useState(false)
   const [isVideoStarted, setIsVideoStarted] = useState(false) // User clicked play
   const [isVideoReady, setIsVideoReady] = useState(false) // Video loaded and ready
+  
+  // File selection state
+  const [torrentFiles, setTorrentFiles] = useState<TorrentFile[]>([])
+  const [torrentName, setTorrentName] = useState<string>('')
+  const [showFileSelector, setShowFileSelector] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement>(null)
 
@@ -55,23 +60,57 @@ function App(): React.JSX.Element {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
   }
 
-  const startStream = useCallback(async (magnetOrPath: string): Promise<void> => {
+  // Add torrent and show file selector if multiple video files
+  const addTorrent = useCallback(async (magnetOrPath: string): Promise<void> => {
+    setIsLoading(true)
+    setError(null)
+    setVideoUrl(null)
+    setTorrentFiles([])
+    setShowFileSelector(false)
+
+    try {
+      const result = await window.api.torrent.add(magnetOrPath)
+      console.log('Torrent added:', result)
+      setTorrentName(result.name)
+
+      // If only one video file, start streaming directly
+      if (result.files.length === 1) {
+        console.log('Single video file, starting stream...')
+        await selectAndPlayFile(result.files[0].index)
+      } else if (result.files.length > 1) {
+        // Multiple video files - show selector
+        console.log('Multiple video files, showing selector...')
+        setTorrentFiles(result.files)
+        setShowFileSelector(true)
+        setIsLoading(false)
+      } else {
+        setError('No video files found in torrent')
+        setIsLoading(false)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to add torrent')
+      console.error('Add torrent error:', err)
+      setIsLoading(false)
+    }
+  }, [])
+
+  // Select a file and start streaming
+  const selectAndPlayFile = useCallback(async (fileIndex: number): Promise<void> => {
     setIsLoading(true)
     setIsBuffering(true)
     setCanPlayVideo(false)
     setIsVideoStarted(false)
     setIsVideoReady(false)
+    setShowFileSelector(false)
     setError(null)
 
     try {
-      const result = await window.api.torrent.start(magnetOrPath)
-      console.log('Stream started:', result)
+      const result = await window.api.torrent.selectFile(fileIndex)
+      console.log('File selected, streaming:', result)
       
-      // Backend automatically returns transcoded URL for MKV/AVI/etc.
-      // USE_TRANSCODING forces transcoding even for MP4 (for testing)
+      // Backend automatically returns correct URL based on file type
       let streamUrl = result.url
       if (USE_TRANSCODING && !streamUrl.includes(':9091')) {
-        // Force transcoding for testing
         streamUrl = streamUrl.replace(':9090', ':9091')
       }
       
@@ -92,7 +131,8 @@ function App(): React.JSX.Element {
 
   const handlePlay = (): void => {
     if (magnetInput.trim()) {
-      startStream(magnetInput.trim())
+      // Use new flow with file selection
+      addTorrent(magnetInput.trim())
     }
   }
 
@@ -118,7 +158,7 @@ function App(): React.JSX.Element {
         const filePath = electronFile.path
         console.log('Dropped torrent file:', file.name, 'Path:', filePath)
         if (filePath) {
-          startStream(filePath)
+          addTorrent(filePath)
         } else {
           // Fallback: read file as buffer
           const reader = new FileReader()
@@ -127,7 +167,7 @@ function App(): React.JSX.Element {
             const uint8 = new Uint8Array(buffer)
             // Convert to base64 for transfer
             const base64 = btoa(String.fromCharCode(...uint8))
-            startStream(`data:application/x-bittorrent;base64,${base64}`)
+            addTorrent(`data:application/x-bittorrent;base64,${base64}`)
           }
           reader.readAsArrayBuffer(file)
         }
@@ -194,6 +234,44 @@ function App(): React.JSX.Element {
         {error && (
           <div className="mb-6 p-4 bg-red-900/30 border border-red-700 rounded-lg text-red-300">
             {error}
+          </div>
+        )}
+
+        {/* File Selector - when torrent has multiple video files */}
+        {showFileSelector && torrentFiles.length > 0 && (
+          <div className="mb-6 p-6 bg-zinc-900 rounded-xl border border-zinc-700">
+            <h3 className="text-xl font-semibold mb-4 text-white">
+              Select a video to play
+            </h3>
+            <p className="text-zinc-400 text-sm mb-4">
+              {torrentName} contains {torrentFiles.length} video files:
+            </p>
+            <div className="space-y-2">
+              {torrentFiles.map((file) => (
+                <button
+                  key={file.index}
+                  onClick={() => selectAndPlayFile(file.index)}
+                  className="w-full p-4 bg-zinc-800 hover:bg-zinc-700 rounded-lg text-left transition-colors group"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-white font-medium truncate group-hover:text-blue-400 transition-colors">
+                        {file.name}
+                      </p>
+                      <p className="text-zinc-500 text-sm">
+                        {file.sizeFormatted}
+                      </p>
+                    </div>
+                    <div className="ml-4 text-blue-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                      </svg>
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
           </div>
         )}
 

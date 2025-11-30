@@ -1,9 +1,35 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+// File info from torrent
+interface TorrentFile {
+  index: number
+  name: string
+  size: number
+  sizeFormatted: string
+  isVideo: boolean
+}
+
 // Torrent API for renderer
 const torrentAPI = {
-  // Start streaming a torrent
+  // Add torrent and get file list for user selection
+  add: (magnetOrPath: string): Promise<{
+    name: string
+    infoHash: string
+    files: TorrentFile[]
+    totalSize: number
+  }> => ipcRenderer.invoke('torrent:add', magnetOrPath),
+
+  // Select a file from torrent and start streaming
+  selectFile: (fileIndex: number): Promise<{
+    url: string
+    name: string
+    size: number
+    infoHash: string
+    transcoded: boolean
+  }> => ipcRenderer.invoke('torrent:select-file', fileIndex),
+
+  // Legacy: Start streaming a torrent (auto-selects best file)
   start: (magnetOrPath: string): Promise<{
     url: string
     name: string

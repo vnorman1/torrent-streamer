@@ -361,6 +361,163 @@ export async function initTorrentEngine(): Promise<void> {
 // ============================================================================
 
 function setupIPCHandlers(): void {
+  // Add torrent and return file list for user selection
+  ipcMain.handle('torrent:add', async (_event, magnetOrPath: string) => {
+    return new Promise((resolve, reject) => {
+      if (!magnetOrPath?.trim()) { reject(new Error('Invalid magnet link or torrent path')); return }
+      if (!client) { reject(new Error('Torrent client not initialized')); return }
+
+      const cleanup = (): Promise<void> => {
+        return new Promise((resolveCleanup) => {
+          if (ffmpegCommand) { try { ffmpegCommand.kill('SIGKILL') } catch { /* */ }; ffmpegCommand = null }
+          if (currentTorrent) {
+            stopSlidingWindow(); stopStatusUpdates()
+            try { client.remove(currentTorrent.infoHash, { destroyStore: true }, () => { resetState(); resolveCleanup() }) }
+            catch { resetState(); resolveCleanup() }
+          } else { resolveCleanup() }
+        })
+      }
+
+      cleanup().then(() => {
+        let torrentInput: string | Buffer = magnetOrPath
+        if (magnetOrPath.startsWith('data:application/x-bittorrent;base64,')) {
+          const base64Data = magnetOrPath.replace('data:application/x-bittorrent;base64,', '')
+          torrentInput = Buffer.from(base64Data, 'base64')
+        }
+
+        let resolved = false
+        const timeout = setTimeout(() => { if (!resolved) { resolved = true; reject(new Error('Connection timeout')) } }, CONNECTION_TIMEOUT)
+
+        const errorHandler = (err: Error): void => {
+          if (!resolved) { resolved = true; clearTimeout(timeout); reject(err); client.removeListener('error', errorHandler) }
+        }
+        client.on('error', errorHandler)
+
+        try {
+          client.add(torrentInput, {
+            store: memoryStore, maxWebConns: 10,
+            announce: ['wss://tracker.openwebtorrent.com', 'wss://tracker.btorrent.xyz', 'wss://tracker.fastcast.nz',
+              'udp://tracker.opentrackr.org:1337/announce', 'udp://tracker.openbittorrent.com:6969/announce',
+              'udp://open.stealth.si:80/announce', 'udp://exodus.desync.com:6969/announce']
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          }, (torrent: any) => {
+            if (resolved) return
+            resolved = true; clearTimeout(timeout); client.removeListener('error', errorHandler)
+            currentTorrent = torrent
+
+            // IMPORTANT: Deselect ALL files initially - don't download anything yet!
+            // But DON'T pause the torrent - keep peer connections alive
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            torrent.files.forEach((f: any) => f.deselect())
+            torrent._paused = false  // Track our own state, not actual pause
+
+            // Get list of video files for user selection
+            // IMPORTANT: Use torrent.files index, not filtered array index!
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const videoFiles = torrent.files
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((f: any, index: number) => ({ file: f, torrentIndex: index }))
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .filter((item: any) => isVideoFile(item.file.name))
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((item: any) => ({
+                index: item.torrentIndex,  // Use original torrent.files index!
+                name: item.file.name,
+                size: item.file.length,
+                sizeFormatted: formatBytes(item.file.length),
+                isVideo: true
+              }))
+
+            console.log('[Torrent] Added:', torrent.name)
+            console.log('[Torrent] Files:', torrent.files.length, '(', videoFiles.length, 'video)')
+            console.log('[Torrent] Peers:', torrent.numPeers, 'connected')
+
+            resolve({
+              name: torrent.name,
+              infoHash: torrent.infoHash,
+              files: videoFiles,
+              totalSize: torrent.length
+            })
+          })
+        } catch (err) {
+          if (!resolved) { resolved = true; clearTimeout(timeout); client.removeListener('error', errorHandler); reject(err) }
+        }
+      })
+    })
+  })
+
+  // Select a file from the torrent and start streaming
+  ipcMain.handle('torrent:select-file', async (_event, fileIndex: number) => {
+    return new Promise((resolve, reject) => {
+      if (!currentTorrent) { reject(new Error('No torrent loaded')); return }
+
+      const torrent = currentTorrent
+      const file = torrent.files[fileIndex]
+      if (!file) { reject(new Error('Invalid file index')); return }
+
+      // Deselect ALL files first
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      torrent.files.forEach((f: any) => f.deselect())
+
+      // Select only the chosen file
+      currentFile = file
+      file.select()
+
+      const bufferConfig = getBufferConfig(file.length)
+      useTranscoding = needsTranscoding(file.name)
+
+      console.log('[Torrent] User selected:', file.name)
+      console.log('[Torrent] Size:', formatBytes(file.length))
+      console.log('[Torrent] Needs transcoding:', useTranscoding)
+
+      // Setup initial pieces for quick start
+      const pieceLength = torrent.pieceLength
+      const startPiece = Math.floor((file.offset || 0) / pieceLength)
+      const quickStartPieces = Math.min(30, Math.ceil((bufferConfig.criticalBufferSeconds * bufferConfig.bytesPerSecond) / pieceLength))
+      const endPiece = Math.min(startPiece + quickStartPieces, torrent.pieces.length - 1)
+      
+      console.log('[Torrent] File offset:', file.offset, 'Piece range:', startPiece, '-', endPiece)
+      
+      // Mark critical pieces
+      if (torrent.critical) { 
+        try { 
+          torrent.critical(startPiece, endPiece)
+          console.log('[Torrent] Marked critical pieces:', startPiece, '-', endPiece)
+        } catch (e) { 
+          console.error('[Torrent] Failed to mark critical:', e)
+        } 
+      }
+
+      torrent._bufferConfig = bufferConfig
+      torrent._paused = false
+      
+      // Resume torrent for the selected file
+      try { 
+        torrent.resume()
+        console.log('[Torrent] Resumed torrent, paused:', torrent.paused)
+      } catch (e) { 
+        console.error('[Torrent] Failed to resume:', e)
+      }
+      
+      startSlidingWindow()
+      startStatusUpdates()
+
+      const streamUrl = useTranscoding 
+        ? 'http://localhost:' + transcodeServerPort + '/'
+        : 'http://localhost:' + rawServerPort + '/'
+
+      resolve({
+        url: streamUrl,
+        name: file.name,
+        size: file.length,
+        contentType: useTranscoding ? 'video/mp4' : getContentType(file.name),
+        infoHash: torrent.infoHash,
+        transcoded: useTranscoding
+      })
+    })
+  })
+
+  // Legacy start handler - auto-selects best file (for backward compatibility)
   ipcMain.handle('torrent:start', async (_event, magnetOrPath: string) => {
     return new Promise((resolve, reject) => {
       if (!magnetOrPath?.trim()) { reject(new Error('Invalid magnet link or torrent path')); return }
@@ -369,7 +526,7 @@ function setupIPCHandlers(): void {
       const cleanup = (): Promise<void> => {
         return new Promise((resolveCleanup) => {
           // Kill FFmpeg if running
-          if (ffmpegCommand) { ffmpegCommand.kill('SIGKILL'); ffmpegCommand = null }
+          if (ffmpegCommand) { try { ffmpegCommand.kill('SIGKILL') } catch { /* */ }; ffmpegCommand = null }
           if (currentTorrent) {
             stopSlidingWindow(); stopStatusUpdates()
             try { client.remove(currentTorrent.infoHash, { destroyStore: true }, () => { console.log('[Torrent] Previous torrent removed'); resetState(); resolveCleanup() }) }
@@ -416,6 +573,10 @@ function setupIPCHandlers(): void {
             torrent.on('error', (err: Error) => console.error('[Torrent] Error:', err.message))
             torrent.on('warning', (warn: Error) => console.warn('[Torrent] Warning:', warn.message))
 
+            // IMPORTANT: Deselect ALL files first!
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            torrent.files.forEach((f: any) => f.deselect())
+
             const videoFile = findBestVideoFile(torrent.files)
             if (!videoFile) { reject(new Error('No video file found')); return }
 
@@ -431,8 +592,7 @@ function setupIPCHandlers(): void {
             console.log('[Torrent] Needs transcoding:', useTranscoding)
             console.log('[Torrent] Est. duration:', Math.round(bufferConfig.estimatedDuration / 60), 'min')
 
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            torrent.files.forEach((f: any) => { if (f !== videoFile) f.deselect() })
+            // Select ONLY the video file
             videoFile.select()
 
             const pieceLength = torrent.pieceLength

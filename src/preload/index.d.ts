@@ -10,6 +10,7 @@ export interface TorrentStatus {
   bufferedAheadSeconds?: number
   bufferSizeMB?: number
   qualityTier?: '4K' | '1080p_high' | '1080p' | '720p' | 'unknown'
+  paused?: boolean
 }
 
 export interface TorrentInfo {
@@ -25,15 +26,33 @@ export interface TorrentInfo {
   ratio?: number
 }
 
+export interface TorrentFile {
+  index: number
+  name: string
+  size: number
+  sizeFormatted: string
+  isVideo: boolean
+}
+
+export interface TorrentAddResult {
+  name: string
+  infoHash: string
+  files: TorrentFile[]
+  totalSize: number
+}
+
 export interface TorrentStartResult {
   url: string
   name: string
   size: number
   infoHash: string
   contentType?: string
+  transcoded?: boolean
 }
 
 export interface TorrentAPI {
+  add: (magnetOrPath: string) => Promise<TorrentAddResult>
+  selectFile: (fileIndex: number) => Promise<TorrentStartResult>
   start: (magnetOrPath: string) => Promise<TorrentStartResult>
   stop: () => Promise<void>
   getInfo: () => Promise<TorrentInfo | null>
