@@ -21,7 +21,9 @@ function createWindow(): void {
     ...(process.platform === 'linux' ? { icon } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
-      sandbox: false
+      sandbox: false,
+      // Enable audio autoplay without user gesture
+      autoplayPolicy: 'no-user-gesture-required'
     }
   })
 
