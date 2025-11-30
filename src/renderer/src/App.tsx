@@ -7,6 +7,9 @@ const TEST_MAGNET = 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1
 // Minimum buffer progress before attempting playback
 const MIN_BUFFER_PERCENT = 2
 
+// Force transcoding even for MP4 (set to false - backend decides automatically)
+const USE_TRANSCODING = false
+
 function App(): React.JSX.Element {
   const [magnetInput, setMagnetInput] = useState(TEST_MAGNET)
   const [isLoading, setIsLoading] = useState(false)
@@ -63,7 +66,17 @@ function App(): React.JSX.Element {
     try {
       const result = await window.api.torrent.start(magnetOrPath)
       console.log('Stream started:', result)
-      setVideoUrl(result.url)
+      
+      // Backend automatically returns transcoded URL for MKV/AVI/etc.
+      // USE_TRANSCODING forces transcoding even for MP4 (for testing)
+      let streamUrl = result.url
+      if (USE_TRANSCODING && !streamUrl.includes(':9091')) {
+        // Force transcoding for testing
+        streamUrl = streamUrl.replace(':9090', ':9091')
+      }
+      
+      console.log('Using stream URL:', streamUrl)
+      setVideoUrl(streamUrl)
       setCurrentMovie({
         name: result.name,
         infoHash: result.infoHash
@@ -243,17 +256,35 @@ function App(): React.JSX.Element {
               onLoadedMetadata={() => {
                 console.log('Video metadata loaded')
                 setIsVideoReady(true)
+                // Debug audio tracks
+                const video = videoRef.current
+                if (video) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  console.log('Audio tracks:', (video as any).audioTracks?.length || 'N/A')
+                  console.log('Video muted:', video.muted)
+                  console.log('Video volume:', video.volume)
+                  // Force unmute
+                  video.muted = false
+                  video.volume = 1.0
+                }
               }}
               onCanPlay={() => {
                 console.log('Video can play')
                 setIsBuffering(false)
                 // User initiated playback - this WILL have audio!
                 if (videoRef.current) {
+                  console.log('Setting up audio...')
                   videoRef.current.muted = false
                   videoRef.current.volume = 1.0
+                  console.log('Volume set to:', videoRef.current.volume, 'Muted:', videoRef.current.muted)
                   videoRef.current.play().then(() => {
-                    console.log('Playing with audio!')
+                    console.log('Playing! Muted:', videoRef.current?.muted, 'Volume:', videoRef.current?.volume)
                   }).catch((err) => console.warn('Play failed:', err))
+                }
+              }}
+              onVolumeChange={() => {
+                if (videoRef.current) {
+                  console.log('Volume changed to:', videoRef.current.volume, 'Muted:', videoRef.current.muted)
                 }
               }}
               onWaiting={() => {
@@ -261,7 +292,7 @@ function App(): React.JSX.Element {
                 setIsBuffering(true)
               }}
               onPlaying={() => {
-                console.log('Video playing')
+                console.log('Video playing, muted:', videoRef.current?.muted, 'volume:', videoRef.current?.volume)
                 setIsBuffering(false)
               }}
               onStalled={() => console.log('Video stalled')}

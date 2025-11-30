@@ -8,6 +8,14 @@ import { initTorrentEngine, destroyTorrentEngine } from './torrent-engine'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
+// Enable all available codecs and features for video/audio playback
+app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport,VaapiVideoDecoder,VaapiVideoEncoder')
+app.commandLine.appendSwitch('disable-features', 'UseChromeOSDirectVideoDecoder')
+app.commandLine.appendSwitch('enable-accelerated-video-decode')
+app.commandLine.appendSwitch('enable-accelerated-video-encode')
+app.commandLine.appendSwitch('ignore-gpu-blocklist')
+app.commandLine.appendSwitch('enable-gpu-rasterization')
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
