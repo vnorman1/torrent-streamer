@@ -1,5 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import type { TorrentStatus, TorrentFile } from '../../preload/index.d'
+import DebugModal from './components/DebugModal'
+import VideoPlayer from './components/VideoPlayer'
 
 // Test magnet - Big Buck Bunny
 const TEST_MAGNET = 'magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969&tr=udp%3A%2F%2Ftracker.empire-js.us%3A1337&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337&tr=wss%3A%2F%2Ftracker.btorrent.xyz&tr=wss%3A%2F%2Ftracker.fastcast.nz&tr=wss%3A%2F%2Ftracker.openwebtorrent.com&ws=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2F&xs=https%3A%2F%2Fwebtorrent.io%2Ftorrents%2Fbig-buck-bunny.torrent'
@@ -13,7 +15,6 @@ const USE_TRANSCODING = false
 function App(): React.JSX.Element {
   const [magnetInput, setMagnetInput] = useState(TEST_MAGNET)
   const [isLoading, setIsLoading] = useState(false)
-  const [isBuffering, setIsBuffering] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [currentMovie, setCurrentMovie] = useState<{
@@ -24,14 +25,17 @@ function App(): React.JSX.Element {
   const [isDragging, setIsDragging] = useState(false)
   const [canPlayVideo, setCanPlayVideo] = useState(false)
   const [isVideoStarted, setIsVideoStarted] = useState(false) // User clicked play
-  const [isVideoReady, setIsVideoReady] = useState(false) // Video loaded and ready
   
-  // File selection state
   const [torrentFiles, setTorrentFiles] = useState<TorrentFile[]>([])
   const [torrentName, setTorrentName] = useState<string>('')
   const [showFileSelector, setShowFileSelector] = useState(false)
-
-  const videoRef = useRef<HTMLVideoElement>(null)
+  
+  // Debug modal state
+  const [showDebugModal, setShowDebugModal] = useState(false)
+  
+  // Video duration state
+  const [videoDuration, setVideoDuration] = useState<number>(0)
+  const [baseStreamUrl, setBaseStreamUrl] = useState<string>('')
 
   // Subscribe to torrent status updates
   useEffect(() => {
@@ -41,6 +45,11 @@ function App(): React.JSX.Element {
     }
     const unsubscribe = window.api.torrent.onStatus((data) => {
       setStatus(data)
+      
+      // Update duration if we get actual duration from ffprobe
+      if (data.actualDuration && data.actualDuration > 0) {
+        setVideoDuration(data.actualDuration)
+      }
       
       // Once we have enough buffer, enable video playback
       const progressPercent = data.progress * 100
@@ -97,12 +106,11 @@ function App(): React.JSX.Element {
   // Select a file and start streaming
   const selectAndPlayFile = useCallback(async (fileIndex: number): Promise<void> => {
     setIsLoading(true)
-    setIsBuffering(true)
     setCanPlayVideo(false)
     setIsVideoStarted(false)
-    setIsVideoReady(false)
     setShowFileSelector(false)
     setError(null)
+    setVideoDuration(0)
 
     try {
       const result = await window.api.torrent.selectFile(fileIndex)
@@ -115,15 +123,20 @@ function App(): React.JSX.Element {
       }
       
       console.log('Using stream URL:', streamUrl)
+      setBaseStreamUrl(streamUrl)  // Save base URL for seeking
       setVideoUrl(streamUrl)
       setCurrentMovie({
         name: result.name,
         infoHash: result.infoHash
       })
+      
+      // Use estimated duration from backend if available, otherwise estimate from file size
+      const duration = result.estimatedDuration || (result.size / (1.5 * 1024 * 1024))
+      setVideoDuration(duration)
+      console.log('Initial estimated duration:', Math.round(duration / 60), 'min')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start stream')
       console.error('Stream error:', err)
-      setIsBuffering(false)
     } finally {
       setIsLoading(false)
     }
@@ -136,14 +149,27 @@ function App(): React.JSX.Element {
     }
   }
 
-  const handleTimeUpdate = (): void => {
-    if (!videoRef.current || !currentMovie) return
-
-    const currentTime = videoRef.current.currentTime
+  const handleTimeUpdate = (currentTime: number): void => {
+    if (!currentMovie) return
 
     // Send playback position to main process for sliding window
     window.api.torrent.updatePlayback(currentTime)
   }
+
+  // Handle seeking for transcoded streams - restart stream at new position
+  const handleSeek = useCallback((seekTime: number): void => {
+    if (!baseStreamUrl) return
+    
+    console.log('[App] Seeking to:', seekTime)
+    
+    // BEST PRACTICE: Update playback position immediately so backend can cleanup old chunks
+    window.api.torrent.updatePlayback(seekTime)
+    
+    // For transcoded streams, we need to restart with new seek position
+    // Add timestamp to force reload
+    const newUrl = `${baseStreamUrl}?t=${seekTime}&_=${Date.now()}`
+    setVideoUrl(newUrl)
+  }, [baseStreamUrl])
 
   const handleDrop = (e: React.DragEvent): void => {
     e.preventDefault()
@@ -190,12 +216,24 @@ function App(): React.JSX.Element {
     <div className="min-h-screen bg-zinc-950 text-white p-6">
       <div className="max-w-6xl mx-auto">
         {/* Header */}
-        <header className="mb-8">
-          <h1 className="text-3xl font-bold text-white">
-            Peer<span className="text-blue-500">.</span> Desktop
-          </h1>
-          <p className="text-zinc-400 mt-1">P2P Streaming Client</p>
+        <header className="mb-8 flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold text-white">
+              Peer<span className="text-blue-500">.</span> Desktop
+            </h1>
+            <p className="text-zinc-400 mt-1">P2P Streaming Client</p>
+          </div>
+          <button
+            onClick={() => setShowDebugModal(true)}
+            className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-lg text-sm font-medium text-zinc-300 hover:text-white transition-colors flex items-center gap-2"
+          >
+            <span className="text-green-400">⚡</span>
+            Debug
+          </button>
         </header>
+        
+        {/* Debug Modal */}
+        <DebugModal isOpen={showDebugModal} onClose={() => setShowDebugModal(false)} />
 
         {/* Input Section */}
         <div
@@ -277,13 +315,6 @@ function App(): React.JSX.Element {
 
         {/* Video Player */}
         <div className="mb-6 rounded-xl overflow-hidden bg-black aspect-video relative">
-          {/* Buffering overlay during playback */}
-          {isBuffering && videoUrl && isVideoStarted && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
-              <div className="animate-spin w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full"></div>
-            </div>
-          )}
-          
           {/* Video ready - waiting for user to click play */}
           {videoUrl && canPlayVideo && !isVideoStarted && (
             <div className="w-full h-full flex items-center justify-center bg-zinc-900 relative">
@@ -298,7 +329,6 @@ function App(): React.JSX.Element {
               <button
                 onClick={() => {
                   setIsVideoStarted(true)
-                  // Video will be shown and play() called with audio
                 }}
                 className="relative z-10 group cursor-pointer"
               >
@@ -313,71 +343,18 @@ function App(): React.JSX.Element {
             </div>
           )}
 
-          {/* Video playing */}
-          {videoUrl && canPlayVideo && isVideoStarted ? (
-            <video
-              ref={videoRef}
+          {/* Video playing - custom player with seeking support */}
+          {videoUrl && canPlayVideo && isVideoStarted && (
+            <VideoPlayer
               src={videoUrl}
-              controls
-              playsInline
-              preload="auto"
+              estimatedDuration={videoDuration}
               onTimeUpdate={handleTimeUpdate}
-              onError={(e) => {
-                const video = e.currentTarget
-                console.error('Video error:', video.error?.message, video.error?.code)
-                setError(`Video playback error: ${video.error?.message || 'Unknown error'}`)
-              }}
-              onLoadStart={() => {
-                console.log('Video load started')
-                setIsBuffering(true)
-              }}
-              onLoadedMetadata={() => {
-                console.log('Video metadata loaded')
-                setIsVideoReady(true)
-                // Debug audio tracks
-                const video = videoRef.current
-                if (video) {
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  console.log('Audio tracks:', (video as any).audioTracks?.length || 'N/A')
-                  console.log('Video muted:', video.muted)
-                  console.log('Video volume:', video.volume)
-                  // Force unmute
-                  video.muted = false
-                  video.volume = 1.0
-                }
-              }}
-              onCanPlay={() => {
-                console.log('Video can play')
-                setIsBuffering(false)
-                // User initiated playback - this WILL have audio!
-                if (videoRef.current) {
-                  console.log('Setting up audio...')
-                  videoRef.current.muted = false
-                  videoRef.current.volume = 1.0
-                  console.log('Volume set to:', videoRef.current.volume, 'Muted:', videoRef.current.muted)
-                  videoRef.current.play().then(() => {
-                    console.log('Playing! Muted:', videoRef.current?.muted, 'Volume:', videoRef.current?.volume)
-                  }).catch((err) => console.warn('Play failed:', err))
-                }
-              }}
-              onVolumeChange={() => {
-                if (videoRef.current) {
-                  console.log('Volume changed to:', videoRef.current.volume, 'Muted:', videoRef.current.muted)
-                }
-              }}
-              onWaiting={() => {
-                console.log('Video waiting for data...')
-                setIsBuffering(true)
-              }}
-              onPlaying={() => {
-                console.log('Video playing, muted:', videoRef.current?.muted, 'volume:', videoRef.current?.volume)
-                setIsBuffering(false)
-              }}
-              onStalled={() => console.log('Video stalled')}
-              className="w-full h-full"
+              onSeek={handleSeek}
             />
-          ) : videoUrl && !canPlayVideo ? (
-            // Buffering state - waiting for enough data
+          )}
+
+          {/* Buffering state - waiting for enough data */}
+          {videoUrl && !canPlayVideo && (
             <div className="w-full h-full flex items-center justify-center text-zinc-400 bg-zinc-900">
               <div className="text-center">
                 <div className="animate-spin w-16 h-16 mx-auto mb-4 border-4 border-blue-500 border-t-transparent rounded-full"></div>
@@ -392,7 +369,10 @@ function App(): React.JSX.Element {
                 )}
               </div>
             </div>
-          ) : (
+          )}
+
+          {/* No video - empty state */}
+          {!videoUrl && (
             <div className="w-full h-full flex items-center justify-center text-zinc-600">
               <div className="text-center">
                 <svg
@@ -469,6 +449,11 @@ function App(): React.JSX.Element {
             {currentMovie && (
               <p className="text-zinc-500 text-sm mt-2 truncate">
                 Playing: {currentMovie.name}
+                {videoDuration > 0 && (
+                  <span className="ml-4 text-zinc-400">
+                    Duration: ~{Math.floor(videoDuration / 60)}m
+                  </span>
+                )}
               </p>
             )}
           </div>

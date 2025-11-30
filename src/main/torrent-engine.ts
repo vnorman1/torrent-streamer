@@ -3,10 +3,13 @@ import { ipcMain, BrowserWindow } from 'electron'
 import { AddressInfo } from 'net'
 import ffmpeg from 'fluent-ffmpeg'
 import ffmpegPath from 'ffmpeg-static'
+import ffprobePath from 'ffprobe-static'
 
-// Fix FFmpeg path for Electron build (asar unpacking)
-const binaryPath = ffmpegPath ? ffmpegPath.replace('app.asar', 'app.asar.unpacked') : ''
-ffmpeg.setFfmpegPath(binaryPath)
+// Fix FFmpeg and FFprobe paths for Electron build (asar unpacking)
+const ffmpegBinaryPath = ffmpegPath ? ffmpegPath.replace('app.asar', 'app.asar.unpacked') : ''
+const ffprobeBinaryPath = ffprobePath?.path ? ffprobePath.path.replace('app.asar', 'app.asar.unpacked') : ''
+ffmpeg.setFfmpegPath(ffmpegBinaryPath)
+ffmpeg.setFfprobePath(ffprobeBinaryPath)
 
 // ============================================================================
 // CONFIGURATION
@@ -19,6 +22,7 @@ const BUFFER_BEHIND_SECONDS = 10
 const STATUS_UPDATE_INTERVAL = 500
 const SLIDING_WINDOW_INTERVAL = 500
 const CONNECTION_TIMEOUT = 60000
+const HARD_LIMIT_BUFFER_MB = 75  // Absolute maximum - pause download if exceeded
 
 const BUFFER_CONFIG = {
   '4K': { minBufferSeconds: 15, maxBufferSeconds: 45, criticalBufferSeconds: 5, bitrateThreshold: 50 * 1024 * 1024 / 8 },
@@ -54,6 +58,7 @@ let isInitialized = false
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let ffmpegCommand: any = null
 let useTranscoding = false
+let actualVideoDuration = 0  // Actual duration from ffprobe (seconds)
 
 // ============================================================================
 // MIME TYPES
@@ -79,6 +84,22 @@ function formatBytes(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+// Get video duration using ffprobe from HTTP URL
+async function getVideoDurationFromUrl(url: string): Promise<number> {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(url, (err: Error | null, metadata: { format?: { duration?: number } }) => {
+      if (err) {
+        console.log('[FFprobe] Error getting duration:', err.message)
+        resolve(0)
+        return
+      }
+      const duration = metadata?.format?.duration || 0
+      console.log('[FFprobe] Video duration:', duration, 'seconds')
+      resolve(duration)
+    })
+  })
 }
 
 function getContentType(filename: string): string {
@@ -203,6 +224,9 @@ function handleRawRequest(req: IncomingMessage, res: ServerResponse): void {
 // TRANSCODING SERVER (FFmpeg converts to browser-compatible format)
 // ============================================================================
 
+let isTranscoding = false   // Track if FFmpeg is active
+let transcodeClientId = 0   // Track client connections
+
 function handleTranscodeRequest(req: IncomingMessage, res: ServerResponse): void {
   if (req.method === 'OPTIONS') {
     res.writeHead(200, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': 'Range, Content-Type', 'Access-Control-Max-Age': '86400' })
@@ -210,7 +234,7 @@ function handleTranscodeRequest(req: IncomingMessage, res: ServerResponse): void
     return
   }
 
-  if (!currentFile) {
+  if (!currentFile || !currentTorrent) {
     res.writeHead(404, { 'Content-Type': 'text/plain' })
     res.end('No file loaded')
     return
@@ -219,18 +243,21 @@ function handleTranscodeRequest(req: IncomingMessage, res: ServerResponse): void
   // Parse seek time from query string
   const url = new URL(req.url || '/', 'http://localhost')
   const seekTime = parseFloat(url.searchParams.get('t') || '0')
+  const clientId = ++transcodeClientId
 
-  console.log('[Transcode] Request, seek:', seekTime, 's')
+  console.log('[Transcode #' + clientId + '] New request, seek:', seekTime, 's')
 
   // Kill previous FFmpeg command if exists
   if (ffmpegCommand) {
+    console.log('[Transcode #' + clientId + '] Killing previous FFmpeg')
     try {
       ffmpegCommand.kill('SIGKILL')
     } catch { /* ignore */ }
     ffmpegCommand = null
+    isTranscoding = false
   }
 
-  // Output MP4 format - remux with AAC audio
+  // Use fragmented MP4 for browser compatibility and seeking
   const headers = {
     'Content-Type': 'video/mp4',
     'Access-Control-Allow-Origin': '*',
@@ -246,54 +273,99 @@ function handleTranscodeRequest(req: IncomingMessage, res: ServerResponse): void
     return
   }
 
-  console.log('[FFmpeg] Starting transcoding with fluent-ffmpeg...')
-  console.log('[FFmpeg] Path:', binaryPath)
+  console.log('[FFmpeg #' + clientId + '] Starting transcoding...')
+  console.log('[FFmpeg #' + clientId + '] File size:', formatBytes(currentFile.length))
 
-  // Create transcoding pipeline using fluent-ffmpeg (as per todo.md)
-  // Video: copy (0 CPU usage)
+  // Calculate byte offset for seek
+  // Estimate bitrate from file size and estimated duration
+  const bufferConfig = currentTorrent._bufferConfig || getBufferConfig(currentFile.length)
+  const estimatedBytesPerSecond = currentFile.length / bufferConfig.estimatedDuration
+  const seekByteOffset = seekTime > 0 ? Math.floor(seekTime * estimatedBytesPerSecond) : 0
+  
+  console.log('[FFmpeg #' + clientId + '] Seek time:', seekTime, 's, byte offset:', formatBytes(seekByteOffset))
+
+  // Create read stream with byte offset for seeking
+  // WebTorrent will start reading from this position, skipping unavailable chunks
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const streamOpts: any = seekByteOffset > 0 ? { start: seekByteOffset } : {}
+  const inputStream = currentFile.createReadStream(streamOpts)
+  
+  inputStream.on('error', (err: Error) => {
+    console.log('[FFmpeg #' + clientId + '] Input stream error:', err.message)
+  })
+
+  // Create transcoding pipeline using fluent-ffmpeg
+  // Video: copy (no re-encoding - 0 CPU)
   // Audio: AAC (browser compatible)
-  const command = ffmpeg(currentFile.createReadStream())
+  // Container: Fragmented MP4 (seekable in browser)
+  const command = ffmpeg(inputStream)
+    .inputOptions([
+      '-probesize 50M',               // Analyze more data for format detection  
+      '-analyzeduration 20M',         // Analyze longer for stream info
+      '-fflags +genpts+discardcorrupt+igndts'  // Handle corrupt/missing data gracefully
+    ])
     .videoCodec('copy')               // Copy video - no re-encoding (0 CPU)
-    .audioCodec('aac')                // Transcode audio to AAC
+    .audioCodec('aac')                // Transcode audio to AAC (browser compatible)
     .audioChannels(2)                 // Stereo
     .audioBitrate('192k')             // Audio bitrate
     .format('mp4')                    // MP4 container
     .outputOptions([
-      '-movflags frag_keyframe+empty_moov+default_base_moof'  // Streaming-friendly fragmented MP4
+      '-movflags frag_keyframe+empty_moov+default_base_moof+faststart',  // Fragmented MP4 for streaming
+      '-max_muxing_queue_size 9999',     // Prevent muxing queue overflow
+      '-avoid_negative_ts make_zero'     // Fix timestamp issues after seek
     ])
     .on('start', (cmd: string) => {
-      console.log('[FFmpeg] Command:', cmd)
+      console.log('[FFmpeg #' + clientId + '] Command:', cmd)
+      isTranscoding = true
+    })
+    .on('progress', (progress: any) => {
+      if (progress.timemark) {
+        console.log('[FFmpeg #' + clientId + '] Progress:', progress.timemark)
+      }
     })
     .on('error', (err: Error) => {
-      // Ignore EPIPE errors (client disconnected)
-      if (!err.message.includes('EPIPE') && !err.message.includes('Readable stream closed') && !err.message.includes('Output stream closed')) {
-        console.log('[FFmpeg] Error:', err.message)
+      isTranscoding = false
+      // Ignore common disconnect errors
+      if (err.message.includes('EPIPE') || 
+          err.message.includes('Readable stream closed') || 
+          err.message.includes('Output stream closed') ||
+          err.message.includes('SIGKILL')) {
+        console.log('[FFmpeg #' + clientId + '] Stopped (client disconnected)')
+      } else {
+        console.log('[FFmpeg #' + clientId + '] Error:', err.message)
       }
       if (!res.writableEnded) res.end()
       ffmpegCommand = null
     })
     .on('end', () => {
-      console.log('[FFmpeg] Transcoding finished')
+      console.log('[FFmpeg #' + clientId + '] Transcoding finished')
+      isTranscoding = false
       if (!res.writableEnded) res.end()
       ffmpegCommand = null
     })
 
-  // Add seek if requested
-  if (seekTime > 0) {
-    command.seekInput(seekTime)
-  }
+  // NOTE: We're NOT using FFmpeg -ss seek anymore!
+  // Instead, we start the WebTorrent stream from the correct byte offset.
+  // This is more reliable because:
+  // 1. FFmpeg -ss on pipe input requires reading from start anyway
+  // 2. WebTorrent can skip missing chunks at the beginning
+  // 3. The byte-level seek is more accurate for our use case
 
   // Save reference for cleanup
   ffmpegCommand = command
 
   // Cleanup on client disconnect
   res.on('close', () => {
-    console.log('[Transcode] Client disconnected')
+    console.log('[Transcode #' + clientId + '] Client disconnected')
+    try {
+      inputStream.destroy()
+    } catch { /* ignore */ }
     if (ffmpegCommand) {
       try {
         ffmpegCommand.kill('SIGKILL')
       } catch { /* ignore */ }
       ffmpegCommand = null
+      isTranscoding = false
     }
   })
 
@@ -395,7 +467,9 @@ function setupIPCHandlers(): void {
 
         try {
           client.add(torrentInput, {
-            store: memoryStore, maxWebConns: 10,
+            store: memoryStore, 
+            maxWebConns: 10,
+            storeCacheSlots: 0,  // Disable cache to prevent memory duplication
             announce: ['wss://tracker.openwebtorrent.com', 'wss://tracker.btorrent.xyz', 'wss://tracker.fastcast.nz',
               'udp://tracker.opentrackr.org:1337/announce', 'udp://tracker.openbittorrent.com:6969/announce',
               'udp://open.stealth.si:80/announce', 'udp://exodus.desync.com:6969/announce']
@@ -506,13 +580,44 @@ function setupIPCHandlers(): void {
         ? 'http://localhost:' + transcodeServerPort + '/'
         : 'http://localhost:' + rawServerPort + '/'
 
+      // Calculate estimated duration based on file size and quality
+      const estimatedDuration = bufferConfig.estimatedDuration
+      actualVideoDuration = estimatedDuration  // Store for status updates
+      
+      // BEST PRACTICE: Try multiple times to get actual duration from ffprobe
+      // First attempt after 1.5s, then retry at 5s and 10s if needed
+      const tryGetDuration = async (attempt: number): Promise<void> => {
+        try {
+          const rawUrl = 'http://localhost:' + rawServerPort + '/'
+          const duration = await getVideoDurationFromUrl(rawUrl)
+          if (duration > 0) {
+            actualVideoDuration = duration
+            console.log('[Torrent] ✓ Got actual duration (attempt ' + attempt + '):', Math.round(duration), 's (' + Math.round(duration / 60) + ' min)')
+          } else if (attempt < 3) {
+            // Retry with exponential backoff
+            const delays = [1500, 5000, 10000]
+            setTimeout(() => tryGetDuration(attempt + 1), delays[attempt])
+          }
+        } catch (e) {
+          console.log('[Torrent] Could not get duration (attempt ' + attempt + '):', e)
+          if (attempt < 3) {
+            const delays = [1500, 5000, 10000]
+            setTimeout(() => tryGetDuration(attempt + 1), delays[attempt])
+          }
+        }
+      }
+      
+      // Start trying to get duration after initial buffer
+      setTimeout(() => tryGetDuration(1), 1500)
+
       resolve({
         url: streamUrl,
         name: file.name,
         size: file.length,
         contentType: useTranscoding ? 'video/mp4' : getContentType(file.name),
         infoHash: torrent.infoHash,
-        transcoded: useTranscoding
+        transcoded: useTranscoding,
+        estimatedDuration: estimatedDuration
       })
     })
   })
@@ -555,7 +660,9 @@ function setupIPCHandlers(): void {
 
         try {
           client.add(torrentInput, {
-            store: memoryStore, maxWebConns: 10,
+            store: memoryStore, 
+            maxWebConns: 10,
+            storeCacheSlots: 0,  // Disable cache to prevent memory duplication
             announce: ['wss://tracker.openwebtorrent.com', 'wss://tracker.btorrent.xyz', 'wss://tracker.fastcast.nz',
               'udp://tracker.opentrackr.org:1337/announce', 'udp://tracker.openbittorrent.com:6969/announce',
               'udp://open.stealth.si:80/announce', 'udp://exodus.desync.com:6969/announce',
@@ -630,7 +737,48 @@ function setupIPCHandlers(): void {
     })
   })
 
-  ipcMain.on('torrent:update-playback', (_event, time: number) => { currentPlaybackTime = time })
+  // Track playback position for sliding window
+  // BEST PRACTICE: Also track seek events to trigger immediate cleanup
+  ipcMain.on('torrent:update-playback', (_event, time: number) => { 
+    const wasSeek = Math.abs(time - currentPlaybackTime) > 5  // Detect seek (> 5 second jump)
+    currentPlaybackTime = time
+    
+    // If this was a seek, immediately trigger cleanup and prioritize new position
+    if (wasSeek && currentTorrent && currentFile) {
+      console.log('[Buffer] 🔄 Seek detected to', Math.round(time), 's - prioritizing new position')
+      
+      // Reset hard pause on seek so we can buffer new position
+      if (currentTorrent._hardPaused) {
+        currentTorrent._hardPaused = false
+        try { currentTorrent.resume() } catch { /* ignore */ }
+      }
+      if (currentTorrent._paused) {
+        currentTorrent._paused = false
+        try { currentTorrent.resume() } catch { /* ignore */ }
+      }
+      
+      // Calculate new position and mark critical pieces
+      const pieceLength = currentTorrent.pieceLength
+      const fileOffset = currentFile.offset || 0
+      const bufferConfig = currentTorrent._bufferConfig || getBufferConfig(currentFile.length)
+      const bytesPerSecond = bufferConfig.bytesPerSecond
+      const seekBytePos = Math.floor(time * bytesPerSecond)
+      const seekPiece = Math.floor((fileOffset + seekBytePos) / pieceLength)
+      const criticalPieces = Math.min(20, Math.ceil((15 * bytesPerSecond) / pieceLength))  // 15 seconds of critical
+      
+      console.log('[Buffer] Seek byte position:', seekBytePos, 'piece:', seekPiece)
+      
+      // Mark pieces as critical starting from seek position
+      if (currentTorrent.critical && seekPiece >= 0) {
+        const totalPieces = currentTorrent.pieces?.length || 0
+        const endPiece = Math.min(seekPiece + criticalPieces, totalPieces - 1)
+        try {
+          currentTorrent.critical(seekPiece, endPiece)
+          console.log('[Buffer] Marked critical pieces:', seekPiece, '-', endPiece)
+        } catch { /* ignore */ }
+      }
+    }
+  })
 
   ipcMain.handle('torrent:stop', async () => {
     if (ffmpegCommand) { ffmpegCommand.kill('SIGKILL'); ffmpegCommand = null }
@@ -699,8 +847,11 @@ function startSlidingWindow(): void {
       const filePieceStart = Math.floor(fileOffset / pieceLength)
       const filePieceEnd = Math.ceil((fileOffset + file.length) / pieceLength) - 1
       const maxBufferBytes = MAX_BUFFER_SIZE_MB * 1024 * 1024
-      const behindBytes = Math.min(BUFFER_BEHIND_SECONDS * bytesPerSecond, maxBufferBytes * 0.15)
-      const aheadBytes = Math.min(maxBufferBytes - behindBytes, bufferConfig.aheadBytes)
+      
+      // BEST PRACTICE: Dynamic buffer sizing based on playback position
+      // Only keep a small window behind (already watched) and focus on what's ahead
+      const behindBytes = Math.min(BUFFER_BEHIND_SECONDS * bytesPerSecond, maxBufferBytes * 0.1)  // Max 10% for behind
+      const aheadBytes = Math.min(maxBufferBytes * 0.9, bufferConfig.aheadBytes)  // 90% for ahead
       const piecesBehind = Math.ceil(behindBytes / pieceLength)
       const piecesAhead = Math.ceil(aheadBytes / pieceLength)
       const windowStart = Math.max(filePieceStart, currentPiece - piecesBehind)
@@ -723,33 +874,114 @@ function startSlidingWindow(): void {
 
       // ACTIVE MEMORY CLEANUP: Delete pieces outside the buffer window
       // This enforces the 70MB limit by removing old pieces from memory
-      // memory-chunk-store uses a simple array: store.chunks[index]
+      // 
+      // STORE STRUCTURE (with storeCacheSlots: 0):
+      //   torrent.store = ImmediateChunkStore
+      //     -> .store = MemoryChunkStore (direct, no cache)
+      //     -> .mem = [] (immediate buffer)
+      //     -> .store.chunks = [] (actual stored chunks)
+      
       let freedCount = 0
-      if (torrent.store && torrent.store.chunks) {
-        const chunks = torrent.store.chunks
-        
-        // Delete pieces before the window (already watched)
-        for (let i = filePieceStart; i < windowStart; i++) {
+      let storedChunksBytes = 0
+      
+      // Navigate to the actual memory-chunk-store
+      const immediateStore = torrent.store
+      const memoryStore = immediateStore?.store  // Direct to memory-chunk-store (no cache wrapper)
+      const chunks = memoryStore?.chunks || []
+      const immediateMem = immediateStore?.mem || []
+      
+      // Count stored chunks
+      for (let i = 0; i < chunks.length; i++) {
+        if (chunks[i]) {
+          storedChunksBytes += chunks[i].length || pieceLength
+        }
+      }
+      
+      // Count immediate buffer
+      for (let i = 0; i < immediateMem.length; i++) {
+        if (immediateMem[i]) {
+          storedChunksBytes += immediateMem[i].length || pieceLength
+        }
+      }
+      
+      const storedChunksMB = storedChunksBytes / (1024 * 1024)
+      const processMemMB = process.memoryUsage().heapUsed / (1024 * 1024)
+      const hardLimitBytes = HARD_LIMIT_BUFFER_MB * 1024 * 1024
+      
+      // ALWAYS CLEAN pieces outside window - don't wait for limit
+      // This is the key to preventing memory bloat!
+      if (chunks.length > 0) {
+        // Delete ALL pieces BEFORE the window
+        for (let i = 0; i < windowStart; i++) {
           if (chunks[i]) {
-            chunks[i] = null  // Free memory
+            chunks[i] = null
             freedCount++
-            // Also update bitfield
-            if (torrent.bitfield && torrent.bitfield.set) {
-              try { torrent.bitfield.set(i, false) } catch { /* ignore */ }
+          }
+          if (immediateMem[i]) {
+            immediateMem[i] = null
+          }
+        }
+        
+        // Delete ALL pieces AFTER the window
+        for (let i = windowEnd + 1; i < chunks.length; i++) {
+          if (chunks[i]) {
+            chunks[i] = null
+            freedCount++
+          }
+          if (immediateMem[i]) {
+            immediateMem[i] = null
+          }
+        }
+      }
+      
+      // HARD LIMIT CHECK using process memory as fallback
+      if (storedChunksBytes > hardLimitBytes || processMemMB > 500) {
+        console.log('[Buffer] ⚠️ MEMORY WARNING! Chunks: ' + storedChunksMB.toFixed(1) + 'MB, Process heap: ' + processMemMB.toFixed(0) + 'MB')
+        
+        // Pause torrent to stop downloading
+        if (!torrent._hardPaused) {
+          try {
+            torrent.pause()
+            torrent._hardPaused = true
+            console.log('[Buffer] 🛑 HARD PAUSED torrent')
+          } catch { /* ignore */ }
+        }
+        
+        // EMERGENCY: Clear everything except current window
+        for (let i = 0; i < chunks.length; i++) {
+          if (i < windowStart || i > windowEnd) {
+            if (chunks[i]) {
+              chunks[i] = null
+              freedCount++
+            }
+            if (immediateMem[i]) {
+              immediateMem[i] = null
             }
           }
         }
         
-        // Delete pieces after the window (too far ahead - shouldn't happen normally)
-        for (let i = windowEnd + 1; i <= filePieceEnd; i++) {
-          if (chunks[i]) {
-            chunks[i] = null  // Free memory  
-            freedCount++
-            if (torrent.bitfield && torrent.bitfield.set) {
-              try { torrent.bitfield.set(i, false) } catch { /* ignore */ }
-            }
-          }
+        // Try to trigger garbage collection
+        if (global.gc) {
+          try { global.gc() } catch { /* ignore */ }
         }
+      }
+      
+      // Recount after cleanup
+      let actualMemoryBytes = 0
+      for (let i = 0; i < chunks.length; i++) {
+        if (chunks[i]) {
+          actualMemoryBytes += chunks[i].length || pieceLength
+        }
+      }
+      const actualMemoryMB = actualMemoryBytes / (1024 * 1024)
+      
+      // Resume if we were hard paused and now under limit
+      if (torrent._hardPaused && actualMemoryBytes < maxBufferBytes * 0.8) {
+        console.log('[Buffer] ✅ Memory under limit, resuming from hard pause')
+        try {
+          torrent.resume()
+          torrent._hardPaused = false
+        } catch { /* ignore */ }
       }
 
       let bufferedStart = currentPiece, bufferedEnd = currentPiece
@@ -761,37 +993,42 @@ function startSlidingWindow(): void {
       const bufferedAheadPieces = Math.max(0, bufferedEnd - currentPiece)
       const bufferedAheadBytes = bufferedAheadPieces * pieceLength
       const bufferedAheadSeconds = bufferedAheadBytes / bytesPerSecond
-      const totalBufferedPieces = Math.max(1, bufferedEnd - bufferedStart + 1)
-      const bufferSizeMB = (totalBufferedPieces * pieceLength) / (1024 * 1024)
+      
+      // Calculate buffer size from ACTUAL memory usage (accurate tracking)
+      const bufferSizeMB = actualMemoryMB
 
       // BUFFER CONTROL: Pause/Resume download based on buffer state
       // If buffer is full (enough data ahead), pause downloading to save memory & bandwidth
+      // BUT: Don't pause if FFmpeg is actively transcoding - it needs continuous data!
       const targetBufferSeconds = bufferConfig.aheadSeconds || 60
       const resumeThreshold = targetBufferSeconds * 0.5  // Resume at 50% of target
       const isBufferFull = bufferedAheadSeconds >= targetBufferSeconds
 
-      if (isBufferFull && !torrent._paused) {
+      // Don't allow resume if hard paused
+      if (isBufferFull && !torrent._paused && !isTranscoding && !torrent._hardPaused) {
         console.log('[Buffer] PAUSING download - buffer full (' + Math.round(bufferedAheadSeconds) + 's ahead, target: ' + Math.round(targetBufferSeconds) + 's)')
         try {
           torrent.pause()
           torrent._paused = true
         } catch { /* ignore */ }
-      } else if (torrent._paused && bufferedAheadSeconds < resumeThreshold) {
-        console.log('[Buffer] RESUMING download - buffer below threshold (' + Math.round(bufferedAheadSeconds) + 's ahead)')
+      } else if (torrent._paused && !torrent._hardPaused && (bufferedAheadSeconds < resumeThreshold || isTranscoding)) {
+        console.log('[Buffer] RESUMING download - ' + (isTranscoding ? 'transcoding active' : 'buffer below threshold') + ' (' + Math.round(bufferedAheadSeconds) + 's ahead)')
         try {
           torrent.resume()
           torrent._paused = false
         } catch { /* ignore */ }
       }
 
-      torrent._bufferInfo = { bufferedAheadSeconds: Math.round(bufferedAheadSeconds), bufferSizeMB: Math.min(bufferSizeMB, MAX_BUFFER_SIZE_MB), windowStart, windowEnd, currentPiece, bufferedStart, bufferedEnd, qualityTier: bufferConfig.tier, paused: torrent._paused || false }
+      torrent._bufferInfo = { bufferedAheadSeconds: Math.round(bufferedAheadSeconds), bufferSizeMB: Math.min(bufferSizeMB, MAX_BUFFER_SIZE_MB), windowStart, windowEnd, currentPiece, bufferedStart, bufferedEnd, qualityTier: bufferConfig.tier, paused: torrent._paused || false, hardPaused: torrent._hardPaused || false }
 
       const now = Date.now()
       if (now - lastLogTime > 5000) {
         lastLogTime = now
-        const freedMsg = freedCount > 0 ? ' | freed ' + freedCount + ' pieces' : ''
-        const pausedMsg = torrent._paused ? ' | PAUSED' : ''
-        console.log('[Buffer] ' + bufferSizeMB.toFixed(1) + 'MB/' + MAX_BUFFER_SIZE_MB + 'MB | ' + Math.round(bufferedAheadSeconds) + 's ahead | pieces ' + currentPiece + '/' + totalPieces + ' | ' + torrent.numPeers + ' peers | ' + formatBytes(torrent.downloadSpeed) + '/s | ' + bufferConfig.tier + (useTranscoding ? ' | TRANSCODING' : '') + freedMsg + pausedMsg)
+        const heapMB = Math.round(process.memoryUsage().heapUsed / (1024 * 1024))
+        const freedMsg = freedCount > 0 ? ' | freed ' + freedCount : ''
+        const pausedMsg = torrent._hardPaused ? ' | 🛑 HARD' : (torrent._paused ? ' | PAUSED' : '')
+        const limitWarning = heapMB > 400 ? ' ⚠️' : ''
+        console.log('[Buffer] chunks:' + bufferSizeMB.toFixed(1) + 'MB heap:' + heapMB + 'MB' + limitWarning + ' | ' + Math.round(bufferedAheadSeconds) + 's | p' + currentPiece + '/' + totalPieces + ' w[' + windowStart + '-' + windowEnd + '] | ' + torrent.numPeers + 'p | ' + formatBytes(torrent.downloadSpeed) + '/s' + (useTranscoding ? ' | TC' : '') + freedMsg + pausedMsg)
       }
     } catch { /* ignore */ }
   }, SLIDING_WINDOW_INTERVAL)
@@ -812,7 +1049,8 @@ function startStatusUpdates(): void {
         downloadSpeed: currentTorrent.downloadSpeed || 0, uploadSpeed: currentTorrent.uploadSpeed || 0, progress,
         numPeers: currentTorrent.numPeers || 0, downloaded: currentTorrent.downloaded || 0, ratio: currentTorrent.ratio || 0,
         bufferedAheadSeconds: bufferInfo.bufferedAheadSeconds, bufferSizeMB: bufferInfo.bufferSizeMB, qualityTier: bufferInfo.qualityTier,
-        transcoded: useTranscoding
+        transcoded: useTranscoding,
+        actualDuration: actualVideoDuration
       })
     }
   }, STATUS_UPDATE_INTERVAL)

@@ -11,6 +11,8 @@ export interface TorrentStatus {
   bufferSizeMB?: number
   qualityTier?: '4K' | '1080p_high' | '1080p' | '720p' | 'unknown'
   paused?: boolean
+  transcoded?: boolean
+  actualDuration?: number  // Actual video duration in seconds from ffprobe
 }
 
 export interface TorrentInfo {
@@ -48,6 +50,7 @@ export interface TorrentStartResult {
   infoHash: string
   contentType?: string
   transcoded?: boolean
+  estimatedDuration?: number  // Estimated video duration in seconds
 }
 
 export interface TorrentAPI {
